@@ -36,6 +36,8 @@ type Foraging struct {
 	toRemove []ecs.Entity
 	resting  []ecs.Entity
 	dances   []ecs.Entity
+	searches []ecs.Entity
+	recruits []ecs.Entity
 
 	patchResourceMapper  *ecs.Map1[comp.Resource]
 	patchVisitsMapper    *ecs.Map2[comp.Resource, comp.Visits]
@@ -44,6 +46,7 @@ type Foraging struct {
 	patchMortalityMapper *ecs.Map1[comp.Mortality]
 	patchConfigMapper    *ecs.Map2[comp.PatchProperties, comp.Trip]
 	foragerMapper        *ecs.Map2[comp.Activity, comp.KnownPatch]
+	loadMapper           *ecs.Map4[comp.Activity, comp.KnownPatch, comp.Milage, comp.NectarLoad]
 
 	activityFilter      *ecs.Filter1[comp.Activity]
 	loadFilter          *ecs.Filter2[comp.Activity, comp.NectarLoad]
@@ -84,6 +87,7 @@ func (s *Foraging) Initialize(w *ecs.World) {
 	s.patchMortalityMapper = s.patchMortalityMapper.New(w)
 	s.patchConfigMapper = s.patchConfigMapper.New(w)
 	s.foragerMapper = s.foragerMapper.New(w)
+	s.loadMapper = s.loadMapper.New(w)
 
 	storeParams := ecs.GetResource[params.Stores](w)
 	energyParams := ecs.GetResource[params.EnergyContent](w)
@@ -294,51 +298,60 @@ func (s *Foraging) searching(w *ecs.World) {
 	}
 	detectionProb := 1.0 - nonDetectionProb
 
-	// TODO: shuffle foragers
-	foragerQuery := s.foragerFilterSimple.Query()
-	for foragerQuery.Next() {
-		act, patch := foragerQuery.Get()
-
+	// decoupled reruits from searchers and implemented shuffling via two separate sclices to imitate BEEHAVE more closely.
+	activityQuery := s.activityFilter.Query()
+	for activityQuery.Next() {
+		act := activityQuery.Get()
 		if act.Current == activity.Searching {
-			if s.rng.Float64() >= detectionProb {
-				continue
-			}
-			p := s.rng.Float64() * cumProb
-			cum := 0.0
-			var selected patchCandidate
-			for _, pch := range s.patches {
-				cum += pch.Probability
-				if cum >= p {
-					selected = pch
-					break
-				}
-			}
-			if act.PollenForager {
-				if selected.HasPollen {
-					patch.Pollen = selected.Patch
-					act.Current = activity.BringPollen
-					res, vis := s.patchVisitsMapper.Get(selected.Patch)
-					res.Pollen -= s.foragerParams.PollenLoad * sz
-					vis.Pollen += s.foragerParams.SquadronSize
-				} else {
-					patch.Pollen = ecs.Entity{}
-				}
-			} else {
-				if selected.HasNectar {
-					patch.Nectar = selected.Patch
-					act.Current = activity.BringNectar
-					res, vis := s.patchVisitsMapper.Get(selected.Patch)
-					res.Nectar -= s.foragerParams.NectarLoad * sz
-					vis.Nectar += s.foragerParams.SquadronSize
-				} else {
-					patch.Nectar = ecs.Entity{}
-				}
-			}
+			s.searches = append(s.searches, activityQuery.Entity())
+		} else if act.Current == activity.Recruited {
+			s.recruits = append(s.recruits, activityQuery.Entity())
 		}
+	}
+	s.rng.Shuffle(len(s.searches), func(i, j int) { s.searches[i], s.searches[j] = s.searches[j], s.searches[i] })
 
-		if act.Current != activity.Recruited {
+	for _, e := range s.searches {
+		act, patch := s.foragerMapper.Get(e)
+
+		if s.rng.Float64() >= detectionProb {
 			continue
 		}
+		p := s.rng.Float64() * cumProb
+		cum := 0.0
+		var selected patchCandidate
+		for _, pch := range s.patches {
+			cum += pch.Probability
+			if cum >= p {
+				selected = pch
+				break
+			}
+		}
+		if act.PollenForager {
+			if selected.HasPollen {
+				patch.Pollen = selected.Patch
+				act.Current = activity.BringPollen
+				res, vis := s.patchVisitsMapper.Get(selected.Patch)
+				res.Pollen -= s.foragerParams.PollenLoad * sz
+				vis.Pollen += s.foragerParams.SquadronSize
+			} else {
+				patch.Pollen = ecs.Entity{}
+			}
+		} else {
+			if selected.HasNectar {
+				patch.Nectar = selected.Patch
+				act.Current = activity.BringNectar
+				res, vis := s.patchVisitsMapper.Get(selected.Patch)
+				res.Nectar -= s.foragerParams.NectarLoad * sz
+				vis.Nectar += s.foragerParams.SquadronSize
+			} else {
+				patch.Nectar = ecs.Entity{}
+			}
+		}
+	}
+
+	s.rng.Shuffle(len(s.recruits), func(i, j int) { s.recruits[i], s.recruits[j] = s.recruits[j], s.recruits[i] })
+	for _, e := range s.recruits {
+		act, patch := s.foragerMapper.Get(e)
 
 		if !act.PollenForager && !patch.Nectar.IsZero() {
 			success := false
@@ -376,11 +389,14 @@ func (s *Foraging) searching(w *ecs.World) {
 	}
 
 	s.patches = s.patches[:0]
+	s.searches = s.searches[:0]
+	s.recruits = s.recruits[:0]
 }
 
 func (s *Foraging) collecting(w *ecs.World) {
 	sz := float64(s.foragerParams.SquadronSize)
 	foragerQuery := s.foragerFilterLoad.Query()
+	// reverted optional shuffling here. If foragers ever were to die because of max milage while some flowerpatches get depleted, shullfing here should be reconsidered.
 	for foragerQuery.Next() {
 		act, patch, milage, load := foragerQuery.Get()
 
